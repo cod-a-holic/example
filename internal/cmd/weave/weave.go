@@ -1,27 +1,3 @@
-// The weave command is a simple preprocessor for markdown files.
-// It builds a table of contents and processes %include directives.
-//
-// Example usage:
-//
-//	$ go run internal/cmd/weave go-types.md > README.md
-//
-// The weave command copies lines of the input file to standard output, with two
-// exceptions:
-//
-// If a line begins with "%toc", it is replaced with a table of contents
-// consisting of links to the top two levels of headers below the %toc symbol.
-//
-// If a line begins with "%include FILENAME TAG", it is replaced with the lines
-// of the file between lines containing "!+TAG" and  "!-TAG". TAG can be omitted,
-// in which case the delimiters are simply "!+" and "!-".
-//
-// Before the included lines, a line of the form
-//
-//	// go get PACKAGE
-//
-// is output, where PACKAGE is constructed from the module path, the
-// base name of the current directory, and the directory of FILENAME.
-// This caption can be suppressed by putting "-" as the final word of the %include line.
 package main
 
 import (
@@ -37,9 +13,38 @@ import (
 	"strings"
 )
 
-var output = flag.String("o", "", "output file (empty means stdout)")
+// exceptions:
+//
+// If a line begins with "%toc", it is replaced with a table of contents
+// consisting of links to the top two levels of headers below the %toc symbol.
+//
+// If a line begins with "%include FILENAME TAG", it is replaced with the lines
+// of the file between lines containing "!+TAG" and  "!-TAG". TAG can be omitted,
+// in which case the entire file is included. Typically used to embed code samples.
+//
+// The relative path FILENAME is resolved from the markdown file location.
+// For example, if the current markdown file is cmd/hello/README.md,
+// and it uses %include, it looks for code.go relative to the cmd/hello/
+// directory. If FILENAME contains no path separators,
+// it is resolved relative to GOROOT/src.
+//
+// In the resulting output, all lines of included code are indented
+// by a single tab, and leading tabs common to all non-blank lines
+// are removed.
+//
+// Comments whose text is "//-" or "//+" are omitted entirely.
+// Comments whose text is "// ^" are replaced by blank lines.
+
+var output = flag.String("o", "", "output file name")
 
 func main() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("recovered from panic: %v", r)
+			os.Exit(1)
+		}
+	}()
+	
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), "usage: weave [flags] <input.md>\n\nflags:\n")
 		flag.PrintDefaults()
@@ -98,7 +103,7 @@ func main() {
 		// headers result in nested lists. However, we want the lowest header depth
 		// to correspond to the root of the list. Otherwise, the entire list is
 		// indented, which turns it into a code block rather than an outline.
-		minTocDepth int
+		minTocDepth = 999 // Initialize to high value instead of 0
 	)
 	scanner := bufio.NewScanner(in)
 	for scanner.Scan() {
@@ -109,19 +114,25 @@ func main() {
 		line = strings.TrimSpace(line)
 		if line == "%toc" {
 			toc = nil
-			minTocDepth = 0
+			minTocDepth = 999 // Reset to high value
 		} else if strings.HasPrefix(line, "# ") ||
 			strings.HasPrefix(line, "## ") ||
 			strings.HasPrefix(line, "### ") ||
 			strings.HasPrefix(line, "#### ") {
 
 			words := strings.Fields(line)
+			if len(words) < 2 {
+				continue // Skip malformed headers
+			}
 			depth := len(words[0])
-			if minTocDepth == 0 || depth < minTocDepth {
+			if depth < minTocDepth {
 				minTocDepth = depth
 			}
 			words = words[1:]
 			text := strings.Join(words, " ")
+			if text == "" {
+				continue // Skip empty headers
+			}
 			anchor := strings.Join(words, "-")
 			anchor = strings.ToLower(anchor)
 			anchor = strings.ReplaceAll(anchor, "**", "")
@@ -132,6 +143,11 @@ func main() {
 	}
 	if scanner.Err() != nil {
 		log.Fatal(scanner.Err())
+	}
+
+	// Reset minTocDepth if no headers were found
+	if minTocDepth == 999 {
+		minTocDepth = 1
 	}
 
 	// Pass 2.
@@ -145,7 +161,7 @@ func main() {
 		case strings.HasPrefix(line, "%toc"): // ToC
 			for _, h := range toc {
 				// Only print two levels of headings.
-				if h.depth-minTocDepth <= 1 {
+				if h.depth-minTocDepth <= 1 && h.text != "" && h.anchor != "" {
 					printf("%s1. [%s](#%s)\n", strings.Repeat("\t", h.depth-minTocDepth), h.text, h.anchor)
 				}
 			}
@@ -174,7 +190,7 @@ func main() {
 			filename := words[1]
 
 			if caption {
-				printf("	// go get golang.org/x/example/%s/%s\n\n",
+				printf("\t// go get golang.org/x/example/%s/%s\n\n",
 					curDir, filepath.Dir(filename))
 			}
 
@@ -194,8 +210,19 @@ func main() {
 	}
 }
 
-// include processes an included file, and returns the included text.
-// Only lines between those matching !+tag and !-tag will be returned.
+// include returns the contents of the named file,
+// restricted to the lines between markers.
+//
+// If tag=="", the entire file is returned.
+// Otherwise, the result comprises the lines between
+// the first line that matches "!+tag" and the first
+// subsequent line that matches "!-tag".
+// The matching lines are excluded.
+//
+// +tag and -tag are regular expressions.
+// In practice, tags are alphanumeric,
+// and the "!" becomes a line comment in the host language,
+// so the tags are ignored when compiling.
 // This is true even if tag=="".
 func include(file, tag string) (string, error) {
 	f, err := os.Open(file)
@@ -238,8 +265,15 @@ func include(file, tag string) (string, error) {
 	return text.String(), nil
 }
 
-// cleanListing removes entirely blank leading and trailing lines from
-// text, and removes n leading tabs.
+// cleanListing returns the lines of text with the following edits:
+//
+// - comments of the form "//" + op are removed, where op is "+" or "-";
+// - comments of the form "// ^" are replaced by blank lines;
+// - a common prefix of tabs is removed from all non-blank lines;
+// - blank lines at the start and end are removed.
+//
+// This allows us to include code samples that contain additional text,
+// and remove n leading tabs.
 func cleanListing(text string) string {
 	lines := strings.Split(text, "\n")
 
