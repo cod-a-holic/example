@@ -1,27 +1,3 @@
-// The weave command is a simple preprocessor for markdown files.
-// It builds a table of contents and processes %include directives.
-//
-// Example usage:
-//
-//	$ go run internal/cmd/weave go-types.md > README.md
-//
-// The weave command copies lines of the input file to standard output, with two
-// exceptions:
-//
-// If a line begins with "%toc", it is replaced with a table of contents
-// consisting of links to the top two levels of headers below the %toc symbol.
-//
-// If a line begins with "%include FILENAME TAG", it is replaced with the lines
-// of the file between lines containing "!+TAG" and  "!-TAG". TAG can be omitted,
-// in which case the delimiters are simply "!+" and "!-".
-//
-// Before the included lines, a line of the form
-//
-//	// go get PACKAGE
-//
-// is output, where PACKAGE is constructed from the module path, the
-// base name of the current directory, and the directory of FILENAME.
-// This caption can be suppressed by putting "-" as the final word of the %include line.
 package main
 
 import (
@@ -37,7 +13,28 @@ import (
 	"strings"
 )
 
-var output = flag.String("o", "", "output file (empty means stdout)")
+// weave takes a markdown file as input and writes an expanded version to stdout.
+//
+// exceptions:
+//
+// If a line begins with "%toc", it is replaced with a table of contents
+// consisting of links to the top two levels of headers below the %toc symbol.
+//
+// If a line begins with "%include FILENAME TAG", it is replaced with the lines
+// of the file between lines containing "!+TAG" and  "!-TAG". TAG can be omitted,
+// in which case the entire file is included. If the final word on the include
+// line is "-", the "go get" comment is suppressed.
+//
+// Example:
+//
+//    %include hello.go greeting
+//    %include hello.go
+//    %include hello.go greeting -
+//    %include hello.go -
+//
+// weave was inspired by the "go doc" presentation tool.
+
+var output = flag.String("o", "", "output file (default stdout)")
 
 func main() {
 	flag.Usage = func() {
@@ -103,7 +100,7 @@ func main() {
 	scanner := bufio.NewScanner(in)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if line == "" || (line[0] != '#' && line[0] != '%') {
+		if line == "" || (len(line) > 0 && line[0] != '#' && line[0] != '%') {
 			continue
 		}
 		line = strings.TrimSpace(line)
@@ -116,9 +113,15 @@ func main() {
 			strings.HasPrefix(line, "#### ") {
 
 			words := strings.Fields(line)
+			if len(words) == 0 {
+				continue
+			}
 			depth := len(words[0])
 			if minTocDepth == 0 || depth < minTocDepth {
 				minTocDepth = depth
+			}
+			if len(words) < 2 {
+				continue
 			}
 			words = words[1:]
 			text := strings.Join(words, " ")
@@ -151,6 +154,9 @@ func main() {
 			}
 		case strings.HasPrefix(line, "%include"):
 			words := strings.Fields(line)
+			if len(words) < 2 {
+				log.Fatalf("not enough words in include line: %s", line)
+			}
 			var section string
 			caption := true
 			switch len(words) {
@@ -174,7 +180,7 @@ func main() {
 			filename := words[1]
 
 			if caption {
-				printf("	// go get golang.org/x/example/%s/%s\n\n",
+				printf("\t// go get golang.org/x/example/%s/%s\n\n",
 					curDir, filepath.Dir(filename))
 			}
 
@@ -194,8 +200,8 @@ func main() {
 	}
 }
 
-// include processes an included file, and returns the included text.
-// Only lines between those matching !+tag and !-tag will be returned.
+// include returns the lines of the named file between lines containing
+// "!+tag" and "!-tag", or the entire file if tag is empty.
 // This is true even if tag=="".
 func include(file, tag string) (string, error) {
 	f, err := os.Open(file)
@@ -238,7 +244,7 @@ func include(file, tag string) (string, error) {
 	return text.String(), nil
 }
 
-// cleanListing removes entirely blank leading and trailing lines from
+// cleanListing removes the minimum number of leading tabs from all non-blank lines of
 // text, and removes n leading tabs.
 func cleanListing(text string) string {
 	lines := strings.Split(text, "\n")
